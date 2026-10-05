@@ -1,6 +1,7 @@
 "use client";
 
 import { useMemo, useState } from "react";
+import * as XLSX from "xlsx";
 
 const demoSuppliers = [
   { name: "한빛테크", price: 92, delivery: 86, quality: 91, risk: 88 },
@@ -14,7 +15,7 @@ export default function Home() {
   const [weights, setWeights] = useState(initialWeights);
   const [suppliers, setSuppliers] = useState(demoSuppliers);
   const [fileName, setFileName] = useState("");
-  const [uploadMessage, setUploadMessage] = useState("CSV를 올리면 실제 분석 데이터로 교체됩니다.");
+  const [uploadMessage, setUploadMessage] = useState("CSV 또는 Excel을 올리면 실제 분석 데이터로 교체됩니다.");
 
   const ranked = useMemo(() => {
     return suppliers
@@ -58,20 +59,26 @@ export default function Home() {
   async function handleFile(file) {
     if (!file) return;
     setFileName(file.name);
-
-    if (!file.name.toLowerCase().endsWith(".csv")) {
-      setUploadMessage("현재 실제 자동 분석은 CSV부터 지원합니다. PDF/Excel은 다음 단계에서 연결합니다.");
-      return;
-    }
+    const lower = file.name.toLowerCase();
 
     try {
-      const text = await file.text();
-      const parsed = parseCsv(text);
-      if (!parsed.length) throw new Error("분석 가능한 행이 없습니다.");
+      let parsed = [];
+      if (lower.endsWith(".csv")) {
+        parsed = parseCsv(await file.text());
+      } else if (lower.endsWith(".xlsx") || lower.endsWith(".xls")) {
+        parsed = await parseExcel(file);
+      } else if (lower.endsWith(".pdf")) {
+        setUploadMessage("PDF는 다음 단계에서 품목·수량·단가·납기 자동 추출 기능으로 연결합니다.");
+        return;
+      } else {
+        throw new Error("CSV 또는 Excel 파일을 선택하세요.");
+      }
+
+      if (!parsed.length) throw new Error("분석 가능한 공급업체 행이 없습니다.");
       setSuppliers(parsed);
       setUploadMessage(`${parsed.length}개 공급업체를 읽어 비교 결과에 반영했습니다.`);
     } catch (error) {
-      setUploadMessage(`CSV 분석 실패: ${error.message}`);
+      setUploadMessage(`파일 분석 실패: ${error.message}`);
     }
   }
 
@@ -89,7 +96,7 @@ export default function Home() {
             </div>
           ))}
         </nav>
-        <div className="sidebar-footer">v0.2 · CSV Analysis</div>
+        <div className="sidebar-footer">v0.2 · CSV + Excel Analysis</div>
       </aside>
 
       <section className="content">
@@ -113,13 +120,13 @@ export default function Home() {
           <article className="card">
             <p className="card-label">견적 데이터 업로드</p>
             <label className="upload-zone">
-              <input type="file" accept=".csv,.pdf,.xlsx,.xls" onChange={(e) => handleFile(e.target.files?.[0])} />
-              <strong>{fileName || "CSV / PDF / Excel 선택"}</strong>
+              <input type="file" accept=".csv,.xlsx,.xls,.pdf" onChange={(e) => handleFile(e.target.files?.[0])} />
+              <strong>{fileName || "CSV / Excel / PDF 선택"}</strong>
               <span>{uploadMessage}</span>
             </label>
             <div style={{display:"flex",gap:8,marginTop:12,flexWrap:"wrap"}}>
               <button onClick={restoreDemo}>데모 데이터 복원</button>
-              <span className="muted" style={{fontSize:12}}>CSV 열: supplier, price, delivery, quality, risk</span>
+              <span className="muted" style={{fontSize:12}}>필수 열: supplier, price, delivery, quality, risk</span>
             </div>
           </article>
         </section>
@@ -169,7 +176,7 @@ export default function Home() {
           </article>
           <article className="card">
             <p className="card-label">NEXT STEP</p><h2>다음 개발 목표</h2>
-            <ol><li>실제 Excel 파일 자동 읽기</li><li>PDF 견적 품목·단가·수량·납기 추출</li><li>가격 이상값 및 공급업체 위험 탐지</li><li>추천 근거와 의사결정 보고서 자동 생성</li></ol>
+            <ol><li>PDF 견적 품목·단가·수량·납기 추출</li><li>실제 금액 기반 가격 점수 자동 정규화</li><li>가격 이상값 및 공급업체 위험 탐지</li><li>추천 근거와 의사결정 보고서 자동 생성</li></ol>
           </article>
         </section>
       </section>
@@ -177,19 +184,47 @@ export default function Home() {
   );
 }
 
+async function parseExcel(file) {
+  const buffer = await file.arrayBuffer();
+  const workbook = XLSX.read(buffer, { type: "array" });
+  if (!workbook.SheetNames.length) throw new Error("Excel 시트를 찾을 수 없습니다.");
+  const sheet = workbook.Sheets[workbook.SheetNames[0]];
+  const rows = XLSX.utils.sheet_to_json(sheet, { header: 1, defval: "", raw: true });
+  return parseTabularRows(rows);
+}
+
 function parseCsv(text) {
   const lines = text.replace(/^\uFEFF/, "").split(/\r?\n/).filter((line) => line.trim());
   if (lines.length < 2) throw new Error("헤더와 데이터 행이 필요합니다.");
-  const headers = splitCsvLine(lines[0]).map((h) => h.trim().toLowerCase());
-  const aliases = { supplier: ["supplier", "name", "vendor", "공급업체", "업체명"], price: ["price", "가격"], delivery: ["delivery", "납기"], quality: ["quality", "품질"], risk: ["risk", "위험"] };
-  const indexOf = (key) => headers.findIndex((h) => aliases[key].includes(h));
-  const idx = { name: indexOf("supplier"), price: indexOf("price"), delivery: indexOf("delivery"), quality: indexOf("quality"), risk: indexOf("risk") };
-  if (Object.values(idx).some((i) => i < 0)) throw new Error("supplier, price, delivery, quality, risk 열을 확인하세요.");
+  const rows = lines.map(splitCsvLine);
+  return parseTabularRows(rows);
+}
 
-  return lines.slice(1).map((line) => {
-    const cols = splitCsvLine(line);
+function parseTabularRows(rows) {
+  if (!rows || rows.length < 2) throw new Error("헤더와 데이터 행이 필요합니다.");
+  const headers = rows[0].map((h) => String(h).trim().toLowerCase());
+  const aliases = {
+    supplier: ["supplier", "name", "vendor", "공급업체", "업체명", "공급사"],
+    price: ["price", "가격", "가격점수"],
+    delivery: ["delivery", "납기", "납기점수"],
+    quality: ["quality", "품질", "품질점수"],
+    risk: ["risk", "위험", "리스크", "위험점수"],
+  };
+  const indexOf = (key) => headers.findIndex((h) => aliases[key].includes(h));
+  const idx = {
+    name: indexOf("supplier"),
+    price: indexOf("price"),
+    delivery: indexOf("delivery"),
+    quality: indexOf("quality"),
+    risk: indexOf("risk"),
+  };
+  if (Object.values(idx).some((i) => i < 0)) {
+    throw new Error("supplier, price, delivery, quality, risk 열을 확인하세요.");
+  }
+
+  return rows.slice(1).map((cols) => {
     const row = {
-      name: cols[idx.name]?.trim(),
+      name: String(cols[idx.name] ?? "").trim(),
       price: Number(cols[idx.price]),
       delivery: Number(cols[idx.delivery]),
       quality: Number(cols[idx.quality]),
